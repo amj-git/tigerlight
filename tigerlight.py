@@ -15,6 +15,12 @@ wlan = network.WLAN(network.STA_IF)
 # ==========================================
 MQTT_BROKER   = "192.168.0.132"  # Your Home Assistant IP
 
+# Status LED colours and flash rate
+RED   = (255, 0, 0)
+BLUE  = (0, 0, 255)
+OFF   = (0, 0, 0)
+FLASH_INTERVAL = 0.2
+
 # Global variables to track light status
 light_on = False
 current_rgb = [255, 255, 255] # Default to White
@@ -23,7 +29,20 @@ current_brightness = 255       # Default Max
 def drive_pins(r, g, b):
     colour=tuple([r,g,b])
     tiny.rgb.set_rgb(*colour)
-    
+
+def flash_wait(seconds, color, condition=None):
+    # Flash `color` on/off at FLASH_INTERVAL for up to `seconds`, returning
+    # early if `condition()` becomes true so we don't overshoot a connect.
+    steps = max(1, int(seconds / FLASH_INTERVAL))
+    on = False
+    for _ in range(steps):
+        on = not on
+        drive_pins(*(color if on else OFF))
+        time.sleep(FLASH_INTERVAL)
+        if condition and condition():
+            return True
+    return False
+
 
 # ==========================================
 # 3. HOME ASSISTANT MQTT CALLBACK HANDLER
@@ -72,15 +91,29 @@ def mqtt_callback(topic, msg):
 # ==========================================
 # 4. NETWORK & REGISTRATION FUNCTIONS
 # ==========================================
-def connect_wifi():    
-    wlan.active(True)    
+def connect_wifi():
+    # Thonny soft-resets (Ctrl-D) instead of power-cycling, which can leave the
+    # radio in a half-connected state from the previous run. Reset it first.
+    wlan.active(False)
+    time.sleep(1)
+    wlan.active(True)
+    wlan.config(pm=0xa11140)  # Disable power-save mode; it's known to drop the DHCP reply, leaving the link stuck at STAT_NOIP (status 2)
+    network.hostname("tigerlight")
+
     if not wlan.isconnected():
         print(f"Connecting to Wi-Fi: {WIFI_SSID}...")
         wlan.connect(WIFI_SSID, WIFI_PASSWORD)
-        network.hostname("tigerlight")
-        while not wlan.isconnected():
-            print(f"Connecting to Wi-Fi: {WIFI_SSID}...")
-            time.sleep(0.5)    
+
+        max_wait = 20
+        while max_wait > 0 and wlan.status() != network.STAT_GOT_IP:
+            max_wait -= 1
+            print("Waiting for connection... status =", wlan.status())
+            if flash_wait(1, RED, lambda: wlan.status() == network.STAT_GOT_IP):
+                break
+
+        if wlan.status() != network.STAT_GOT_IP:
+            raise RuntimeError(f"Wi-Fi connection failed, status: {wlan.status()}")
+
     print("Wi-Fi Connected! IP Address:", wlan.ifconfig()[0])
 
 # Generate identifiers for MQTT and Auto-Discovery
@@ -111,15 +144,29 @@ discovery_payload = {
 # ==========================================
 # 5. MAIN LOOP PROCESS
 # ==========================================
+def connect_mqtt(max_attempts=5):
+    # Right after Wi-Fi reports an IP, the router/AP hasn't always finished
+    # settling routes, so the first TCP connect to the broker can get
+    # ECONNABORTED. Retry in place rather than letting one blip fall through
+    # to the outer except and hard-reset the board.
+    client = MQTTClient(device_id, MQTT_BROKER, user=MQTT_USER, password=MQTT_PASSWORD)
+    client.set_callback(mqtt_callback)
+    for attempt in range(1, max_attempts + 1):
+        drive_pins(*BLUE)
+        try:
+            client.connect()
+            return client
+        except OSError as e:
+            print(f"MQTT connect attempt {attempt}/{max_attempts} failed: {e}")
+            flash_wait(2, BLUE)
+    raise RuntimeError("Could not connect to MQTT broker")
+
 connect_wifi()
 
 try:
     # Initialize the secure MQTT client with credentials
-    client = MQTTClient(device_id, MQTT_BROKER, user=MQTT_USER, password=MQTT_PASSWORD)
-    print("Created MQTT Client object.")
-    client.set_callback(mqtt_callback)
-    print("MQTT Callback Set.  Connecting to broker...")
-    client.connect()
+    print("Connecting to MQTT broker...")
+    client = connect_mqtt()
     print("Connected to MQTT Broker.")
     
     # Register with Home Assistant Auto-Discovery
